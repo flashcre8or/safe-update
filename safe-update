@@ -1,0 +1,752 @@
+#!/usr/bin/env bash
+# safe-update — Rolling update with age gate, supply-chain safeguards, and chroot builds
+# Copyright (C) 2026 Patrick C
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+set -euo pipefail
+
+# ── config ────────────────────────────────────────────────────────────────────
+MIN_AGE_HOURS=${SAFE_UPDATE_AGE:-72}
+MIN_AGE_SECONDS=$((MIN_AGE_HOURS * 3600))
+NOW=$(date +%s)
+SCRIPT_NAME=$(basename "$0")
+readonly SCRIPT_NAME
+readonly AUR_API="https://aur.archlinux.org/rpc/v5/info"
+readonly AUR_BATCH_SIZE=150
+readonly DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/safe-update"
+readonly PKGBUILD_STORE="$DATA_DIR/pkgbuilds"
+readonly MAINTAINER_DB="$DATA_DIR/maintainers.tsv"
+readonly AUR_TARBALL_DIR="$HOME/Aur-Update-Tarballs"
+readonly CHROOT_DIR="/var/lib/archbuild"
+readonly KEEP_PKG_VERSIONS=3
+
+# Compromised-package list sources. Add verified URLs as new lists emerge.
+readonly -a COMPROMISED_LIST_URLS=(
+  "https://raw.githubusercontent.com/lenucksi/aur-malware-check/master/package_list.txt"
+)
+
+# ── colors ────────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  R='\033[0;31m'
+  G='\033[0;32m'
+  Y='\033[1;33m'
+  C='\033[0;36m'
+  B='\033[1m'
+  N='\033[0m'
+else
+  R=''
+  G=''
+  Y=''
+  C=''
+  B=''
+  N=''
+fi
+
+# ── basic helpers ─────────────────────────────────────────────────────────────
+info() { echo -e "${C}::${N} $*"; }
+ok() { echo -e "${G}✓${N} $*"; }
+warn() { echo -e "${Y}⚠${N} $*" >&2; }
+err() { echo -e "${R}✗${N} $*" >&2; }
+
+_show_pkgbuild() {
+  if command -v bat &>/dev/null; then
+    bat --language=bash --style=numbers,header -
+  else
+    less -R
+  fi
+}
+
+# ── scan_pkgbuild ─────────────────────────────────────────────────────────────
+# Print flagged lines with line numbers. Returns 1 if anything suspicious found.
+scan_pkgbuild() {
+  local content="$1"
+  local -i hits=0
+
+  _check() {
+    local matches
+    matches=$(printf '%s' "$content" | grep -nP "$2" 2>/dev/null || true)
+    [ -z "$matches" ] && return 0
+    echo -e "  ${R}▶ $1${N}"
+    while IFS= read -r m; do echo -e "    ${Y}${m}${N}"; done <<<"$matches"
+    return 1
+  }
+
+  _check "package manager install (Atomic Arch vector)" '(npm|bun|pip3?|gem|cargo)\s+install' || ((hits++)) || true
+  _check "pipe to shell" '(curl|wget)\b[^#\n]*\|\s*(ba)?sh\b' || ((hits++)) || true
+  _check "eval with command substitution" 'eval\s+\$\(' || ((hits++)) || true
+  _check "base64 decode" 'base64\s+(-d|--decode)' || ((hits++)) || true
+  _check "curl/wget to bare IP address" '(curl|wget)\s+\S*[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' || ((hits++)) || true
+  _check "write to home dir / outside \$pkgdir" '(\$\{?HOME\}?|~/)[^[:space:]]' || ((hits++)) || true
+  _check "systemd user-unit path (persistence)" '\.config/systemd/user' || ((hits++)) || true
+  _check "systemctl enable" 'systemctl\s+enable' || ((hits++)) || true
+  _check "background process (nohup/disown)" '\b(nohup|disown)\b' || ((hits++)) || true
+
+  [ $hits -gt 0 ] && return 1 || return 0
+}
+
+# ── show_pkgbuild_diff ────────────────────────────────────────────────────────
+# Diff current content against stored version. Returns 1 if changed/new, 0 if unchanged.
+show_pkgbuild_diff() {
+  local pkg="$1" content="$2" ftype="${3:-PKGBUILD}"
+  local stored="$PKGBUILD_STORE/${pkg}.${ftype}"
+
+  if [ ! -f "$stored" ]; then
+    echo -e "  ${Y}First time reviewing — no stored version, showing full content${N}"
+    printf '%s\n' "$content" | _show_pkgbuild
+    return 1
+  fi
+
+  if diff -q "$stored" <(printf '%s\n' "$content") &>/dev/null; then
+    ok "$ftype unchanged since last review"
+    return 0
+  fi
+
+  echo -e "  ${Y}Changes since last review:${N}"
+  if command -v bat &>/dev/null; then
+    { diff -u "$stored" <(printf '%s\n' "$content") \
+      --label "stored $ftype" --label "current $ftype" || true; } |
+      bat --language=diff -
+  else
+    { diff -u --color=always "$stored" <(printf '%s\n' "$content") \
+      --label "stored $ftype" --label "current $ftype" || true; } |
+      less -R
+  fi
+  return 1
+}
+
+# ── build_aur_chroot ──────────────────────────────────────────────────────────
+# Build a pre-cloned AUR package in a clean chroot, copy tarballs to staging, install.
+# src_dir must be the already-cloned package directory (same bytes the user reviewed).
+build_aur_chroot() {
+  local pkg="$1" src_dir="$2"
+
+  info "[$pkg] Building in chroot (this may take a while)..."
+  local result=0
+  (
+    set -e
+    cd "$src_dir"
+    sudo makechrootpkg -c -r "$CHROOT_DIR"
+
+    mapfile -t tarballs < <(find . -maxdepth 1 \
+      \( -name '*.pkg.tar.zst' -o -name '*.pkg.tar.xz' \) | sort)
+    if [ ${#tarballs[@]} -eq 0 ]; then
+      echo "ERROR: no tarballs produced for $pkg" >&2
+      exit 1
+    fi
+
+    cp -- "${tarballs[@]}" "$AUR_TARBALL_DIR/"
+
+    confirm_flag=""
+    [ "$AUTO" = true ] && confirm_flag="--noconfirm"
+    # shellcheck disable=SC2086
+    sudo pacman -U $confirm_flag "${tarballs[@]}"
+  ) || result=$?
+
+  [ $result -eq 0 ] && ok "[$pkg] Built and installed" || err "[$pkg] Failed (exit $result)"
+  return $result
+}
+
+# ── cleanup_pkg_caches ────────────────────────────────────────────────────────
+cleanup_pkg_caches() {
+  if ! command -v paccache &>/dev/null; then
+    warn "paccache not found (install pacman-contrib) — skipping cache cleanup"
+    return
+  fi
+  info "Pruning package caches (keeping ${KEEP_PKG_VERSIONS} versions per package)..."
+  sudo paccache -rqk"$KEEP_PKG_VERSIONS"
+  ok "Pacman cache pruned"
+  if [ -d "$AUR_TARBALL_DIR" ]; then
+    paccache -rqk"$KEEP_PKG_VERSIONS" -c "$AUR_TARBALL_DIR" 2>/dev/null || true
+    ok "AUR tarball cache pruned"
+  fi
+}
+
+# ── _get_pkgnames ─────────────────────────────────────────────────────────────
+# Parse pkgname (scalar or array, including multiline) from a PKGBUILD file.
+# Falls back to the AUR package name if parsing fails.
+_get_pkgnames() {
+  local pkgbuild_path="$1" fallback="$2"
+  python3 - "$pkgbuild_path" "$fallback" <<'EOF'
+import sys, re
+path, fallback = sys.argv[1], sys.argv[2]
+try:
+    content = open(path).read()
+    m = re.search(r'pkgname=\((.*?)\)', content, re.DOTALL)
+    if m:
+        names = re.findall(r"['\"]?([a-z0-9@._+\-]+)['\"]?", m.group(1))
+        print('\n'.join(n for n in names if n))
+    else:
+        m = re.search(r'^pkgname=[\'"]?([a-z0-9@._+\-]+)', content, re.MULTILINE)
+        print(m.group(1) if m else fallback)
+except Exception:
+    print(fallback)
+EOF
+}
+
+# ── _cleanup_build_dirs ───────────────────────────────────────────────────────
+# Registered as a trap EXIT handler; removes all temp clone directories.
+_cleanup_build_dirs() {
+  local _pkg _parent
+  declare -p _build_dirs &>/dev/null || return 0
+  for _pkg in "${!_build_dirs[@]}"; do
+    _parent=$(dirname "${_build_dirs[$_pkg]}")
+    rm -rf "$_parent"
+  done
+}
+
+# ── save_maintainer_db ────────────────────────────────────────────────────────
+save_maintainer_db() {
+  local tmp
+  tmp=$(mktemp)
+  # Preserve existing entries not seen this run
+  if [ -f "$MAINTAINER_DB" ]; then
+    while IFS=$'\t' read -r _pkg _maint _ts; do
+      [[ -z "$_pkg" || "$_pkg" == '#'* ]] && continue
+      [[ -v _current_maintainer["$_pkg"] ]] && continue
+      printf '%s\t%s\t%s\n' "$_pkg" "$_maint" "$_ts"
+    done <"$MAINTAINER_DB"
+  fi >>"$tmp"
+  # Write/update entries seen this run
+  for _pkg in "${!_current_maintainer[@]}"; do
+    printf '%s\t%s\t%s\n' "$_pkg" "${_current_maintainer[$_pkg]}" "$NOW"
+  done >>"$tmp"
+  mv "$tmp" "$MAINTAINER_DB"
+  ok "Maintainer DB saved (${#_current_maintainer[@]} entries written)"
+}
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [-y] [min_age_hours]
+  -y              Skip final update confirmation
+  min_age_hours   Minimum package age in hours (default: $MIN_AGE_HOURS)
+
+Examples:
+  $SCRIPT_NAME              Default (${MIN_AGE_HOURS}h window)
+  $SCRIPT_NAME 24           Shorten window — use when applying a verified CVE patch urgently
+  $SCRIPT_NAME 168          Extend to one week for extra caution
+
+Environment:
+  SAFE_UPDATE_AGE  Same as min_age_hours argument
+EOF
+  exit 0
+}
+
+# ── parse flags ───────────────────────────────────────────────────────────────
+AUTO=false
+while getopts ":yh" opt; do
+  case $opt in
+  y) AUTO=true ;;
+  h) usage ;;
+  *)
+    err "Unknown flag: -$OPTARG"
+    usage
+    ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] && MIN_AGE_HOURS=$1 && MIN_AGE_SECONDS=$((MIN_AGE_HOURS * 3600))
+
+CONFIRM_FLAG=""
+[ "$AUTO" = true ] && CONFIRM_FLAG="--noconfirm"
+
+# ── ensure data directories ───────────────────────────────────────────────────
+mkdir -p "$PKGBUILD_STORE" "$AUR_TARBALL_DIR"
+
+# ── detect chroot availability ────────────────────────────────────────────────
+CHROOT_AVAILABLE=false
+command -v makechrootpkg &>/dev/null && [ -d "$CHROOT_DIR/root" ] && CHROOT_AVAILABLE=true
+
+# ── header ────────────────────────────────────────────────────────────────────
+echo -e "${B}==============================================================${N}"
+echo -e "${B}  safe-update${N}"
+echo -e "  Min package age : ${C}${MIN_AGE_HOURS}h${N}"
+echo -e "  Chroot builds   : ${C}${CHROOT_AVAILABLE}${N}"
+echo -e "  $(date)"
+echo -e "${B}==============================================================${N}"
+
+# ── 1. sync ───────────────────────────────────────────────────────────────────
+info "Syncing package databases..."
+sudo pacman -Sy &>/dev/null || {
+  err "Sync failed"
+  exit 1
+}
+ok "Databases synced"
+
+# ── 1b. compromised list ──────────────────────────────────────────────────────
+COMPROMISE_FETCH_FAILED=false
+declare -A _cmp_set=()
+info "Fetching known-compromised package list(s)..."
+for _url in "${COMPROMISED_LIST_URLS[@]}"; do
+  if _data=$(curl -sf --max-time 10 "$_url" 2>/dev/null); then
+    while IFS= read -r _line; do
+      [[ -z "${_line// /}" || "$_line" == '#'* ]] && continue
+      _cmp_set["$_line"]=1
+    done <<<"$_data"
+    ok "Loaded: $(basename "$_url") (running total: ${#_cmp_set[@]} entries)"
+  else
+    warn "Could not fetch: $_url"
+    COMPROMISE_FETCH_FAILED=true
+  fi
+done
+[ ${#_cmp_set[@]} -eq 0 ] && [ "$COMPROMISE_FETCH_FAILED" = true ] &&
+  warn "No compromised lists fetched — continuing without cross-reference"
+
+# ── 1c. load maintainer DB ────────────────────────────────────────────────────
+declare -A _known_maintainer=()
+declare -A _current_maintainer=()
+if [ -f "$MAINTAINER_DB" ]; then
+  while IFS=$'\t' read -r _pkg _maint _ts; do
+    [[ -z "$_pkg" || "$_pkg" == '#'* ]] && continue
+    _known_maintainer["$_pkg"]="$_maint"
+  done <"$MAINTAINER_DB"
+  ok "Maintainer DB loaded (${#_known_maintainer[@]} entries)"
+else
+  info "No maintainer DB yet — this run populates the baseline (no ownership flags this run)"
+fi
+
+# ── 2. pending updates ────────────────────────────────────────────────────────
+info "Checking for available updates..."
+mapfile -t raw_updates < <(yay -Qu 2>/dev/null | grep -v '^\s*$' || true)
+if [ ${#raw_updates[@]} -eq 0 ]; then
+  ok "System is up to date!"
+  exit 0
+fi
+
+declare -a all_pkgs=()
+for line in "${raw_updates[@]}"; do
+  pkg=$(echo "$line" | awk '{print $1}' | sed 's|.*/||')
+  all_pkgs+=("$pkg")
+done
+echo -e "  ${#all_pkgs[@]} package(s) pending"
+
+# ── 3. classify by age ────────────────────────────────────────────────────────
+declare -a safe_list=()
+declare -a skip_list=()
+declare -a devel_list=()
+declare -a search_aur=()
+declare -a flagged_list=()
+declare -a unknown=()
+declare -a compromised_list=()
+declare -a ownership_changed_list=()
+declare -a user_skip_list=()
+declare -A _is_aur=()
+declare -A _ownership_info=()
+declare -A _build_dirs=()
+
+age_pkg() {
+  local pkg=$1 age build_epoch
+  build_epoch=$(expac -t '%s' -S '%n %b' "$pkg" 2>/dev/null | awk 'NR==1{print $2}')
+  if [ -n "$build_epoch" ] && [ "$build_epoch" != "$pkg" ]; then
+    age=$((NOW - build_epoch))
+    [ "$age" -ge "$MIN_AGE_SECONDS" ] && safe_list+=("$pkg") || skip_list+=("$pkg")
+    return
+  fi
+  search_aur+=("$pkg")
+  _is_aur["$pkg"]=1
+}
+
+# Compromised packages are routed directly — never enter the age-check pipeline.
+for pkg in "${all_pkgs[@]}"; do
+  [[ -v _cmp_set["$pkg"] ]] && compromised_list+=("$pkg") || age_pkg "$pkg"
+done
+
+# ── 4. batch-resolve AUR packages ─────────────────────────────────────────────
+resolve_aur_batch() {
+  local items=("$@")
+  local args="" first=true data
+  local name last_mod out_of_date maintainer age line
+
+  for pkg in "${items[@]}"; do
+    $first && {
+      args+="arg%5B%5D=$pkg"
+      first=false
+    } || args+="&arg%5B%5D=$pkg"
+  done
+  data=$(curl -sf "$AUR_API?$args" 2>/dev/null) || return
+
+  while read -r line; do
+    name=$(echo "$line" | jq -r '.Name         // empty')
+    last_mod=$(echo "$line" | jq -r '.LastModified // empty')
+    out_of_date=$(echo "$line" | jq -r '.OutOfDate    // empty')
+    maintainer=$(echo "$line" | jq -r '.Maintainer  // ""')
+    [ -z "$name" ] || [ -z "$last_mod" ] && continue
+
+    _current_maintainer["$name"]="$maintainer"
+
+    if [ -n "$out_of_date" ] && [ "$out_of_date" != "null" ]; then
+      flagged_list+=("$name")
+      continue
+    fi
+
+    age=$((NOW - last_mod))
+    if [[ "$name" =~ -(git|cvs|svn|bzr|darcs|hg|fossil|always)$ ]]; then
+      [ "$age" -ge "$MIN_AGE_SECONDS" ] && devel_list+=("$name") || skip_list+=("$name")
+    else
+      [ "$age" -ge "$MIN_AGE_SECONDS" ] && safe_list+=("$name") || skip_list+=("$name")
+    fi
+  done < <(echo "$data" | jq -c '.results[]' 2>/dev/null)
+}
+
+if [ ${#search_aur[@]} -gt 0 ]; then
+  info "Checking AUR packages (${#search_aur[@]} total)..."
+  for ((i = 0; i < ${#search_aur[@]}; i += AUR_BATCH_SIZE)); do
+    batch=("${search_aur[@]:i:AUR_BATCH_SIZE}")
+    resolve_aur_batch "${batch[@]}"
+  done
+
+  mapfile -t safe_list < <(printf '%s\n' "${safe_list[@]+"${safe_list[@]}"}" | sort -u)
+  mapfile -t skip_list < <(printf '%s\n' "${skip_list[@]+"${skip_list[@]}"}" | sort -u)
+  mapfile -t flagged_list < <(printf '%s\n' "${flagged_list[@]+"${flagged_list[@]}"}" | sort -u)
+  mapfile -t devel_list < <(printf '%s\n' "${devel_list[@]+"${devel_list[@]}"}" | sort -u)
+
+  declare -A _resolved=()
+  for pkg in "${safe_list[@]+"${safe_list[@]}"}" "${skip_list[@]+"${skip_list[@]}"}" \
+    "${flagged_list[@]+"${flagged_list[@]}"}" "${devel_list[@]+"${devel_list[@]}"}"; do
+    _resolved["$pkg"]=1
+  done
+  for pkg in "${search_aur[@]}"; do [[ -v _resolved["$pkg"] ]] || unknown+=("$pkg"); done
+fi
+
+# ── 4b. ownership change check ────────────────────────────────────────────────
+# Only runs when a baseline DB exists; first run just records without flagging.
+if [ ${#_known_maintainer[@]} -gt 0 ]; then
+  for pkg in "${!_current_maintainer[@]}"; do
+    current="${_current_maintainer[$pkg]}"
+    if [[ -v _known_maintainer["$pkg"] ]]; then
+      known="${_known_maintainer[$pkg]}"
+      if [ "$current" != "$known" ]; then
+        ownership_changed_list+=("$pkg")
+        _ownership_info["$pkg"]="'${known:-orphaned}' → '${current:-orphaned}'"
+      fi
+    fi
+  done
+fi
+
+# ── 5. summary ────────────────────────────────────────────────────────────────
+echo
+echo -e "${B}--- Summary ---${N}"
+
+if [ ${#compromised_list[@]} -gt 0 ]; then
+  echo -e "${B}${R}COMPROMISED (known supply-chain attack — SKIPPING):${N}"
+  printf '  %s\n' "${compromised_list[@]}"
+  echo
+elif [ "$COMPROMISE_FETCH_FAILED" = true ]; then
+  echo -e "${Y}⚠ Compromised list unavailable — cross-reference skipped${N}"
+  echo
+fi
+
+if [ ${#ownership_changed_list[@]} -gt 0 ]; then
+  echo -e "${B}${R}MAINTAINER CHANGED (review required before updating):${N}"
+  for pkg in "${ownership_changed_list[@]}"; do
+    echo -e "  ${R}${pkg}${N}  ${Y}${_ownership_info[$pkg]}${N}"
+  done
+  echo
+fi
+
+[ ${#devel_list[@]} -gt 0 ] && {
+  echo -e "${C}Devel packages (PKGBUILD age >= ${MIN_AGE_HOURS}h):${N}"
+  printf '  %s\n' "${devel_list[@]}"
+  echo
+}
+[ ${#safe_list[@]} -gt 0 ] && {
+  echo -e "${G}Safe (age >= ${MIN_AGE_HOURS}h):${N}"
+  printf '  %s\n' "${safe_list[@]}"
+  echo
+}
+[ ${#skip_list[@]} -gt 0 ] && {
+  echo -e "${Y}SKIPPED (age < ${MIN_AGE_HOURS}h):${N}"
+  printf '  %s\n' "${skip_list[@]}"
+  echo
+}
+[ ${#flagged_list[@]} -gt 0 ] && {
+  echo -e "${R}FLAGGED (AUR OutOfDate — skipped):${N}"
+  printf '  %s\n' "${flagged_list[@]}"
+  echo
+}
+[ ${#unknown[@]} -gt 0 ] && {
+  echo -e "${Y}UNKNOWN (skipped):${N}"
+  printf '  %s\n' "${unknown[@]}"
+  echo
+}
+
+if [ ${#safe_list[@]} -eq 0 ] && [ ${#devel_list[@]} -eq 0 ]; then
+  warn "No packages eligible for update."
+  [ ${#_current_maintainer[@]} -gt 0 ] && save_maintainer_db
+  exit 0
+fi
+
+# ── 5b. Arch Linux news ───────────────────────────────────────────────────────
+if news_data=$(curl -sf --max-time 10 https://archlinux.org/feeds/news/ 2>/dev/null); then
+  echo -e "${C}--- Arch Linux News ---${N}"
+  echo "$news_data" | python3 -c "
+import sys, xml.etree.ElementTree as ET
+tree = ET.parse(sys.stdin)
+for item in tree.findall('.//item')[:5]:
+    title   = item.findtext('title',   '').strip()
+    pubdate = item.findtext('pubDate', '').strip()
+    if title: print(f'  {pubdate}  |  {title}')
+" 2>/dev/null || true
+  echo
+fi
+
+# ── 5c. Maintainer transfer review ───────────────────────────────────────────
+declare -a ownership_approved_list=()
+declare -a ownership_declined_list=()
+
+if [ ${#ownership_changed_list[@]} -gt 0 ]; then
+  echo -e "${C}--- Maintainer Transfer Review ---${N}"
+  echo -e "  Review each transfer before it proceeds to PKGBUILD review."
+  echo
+  for pkg in "${ownership_changed_list[@]}"; do
+    echo -e "${B}════ $pkg ════${N}"
+    echo -e "  ${Y}Maintainer: ${_ownership_info[$pkg]}${N}"
+    _prev="${_known_maintainer[$pkg]:-}"
+    _curr="${_current_maintainer[$pkg]:-}"
+    if [ -z "$_prev" ] || [ "$_prev" = "null" ]; then
+      warn "Orphan adoption — package was previously unmaintained"
+    elif [ -z "$_curr" ]; then
+      warn "Package newly orphaned — maintainer has stepped down"
+    fi
+    echo
+    echo -en "${C}Allow this transfer and proceed to PKGBUILD review? [y/N] ${N}"
+    read -r _own_ans
+    if [[ "$_own_ans" =~ ^[Yy] ]]; then
+      ownership_approved_list+=("$pkg")
+    else
+      warn "Skipping '$pkg' — transfer not approved."
+      ownership_declined_list+=("$pkg")
+    fi
+    echo
+  done
+fi
+
+# ── 5d. PKGBUILD review ───────────────────────────────────────────────────────
+declare -a aur_to_build=()
+for pkg in "${safe_list[@]+"${safe_list[@]}"}" "${devel_list[@]+"${devel_list[@]}"}"; do
+  [[ -v _is_aur["$pkg"] ]] && aur_to_build+=("$pkg")
+done
+# Approved ownership transfers join the PKGBUILD review queue
+for pkg in "${ownership_approved_list[@]+"${ownership_approved_list[@]}"}"; do
+  aur_to_build+=("$pkg")
+done
+
+# Clone all AUR packages upfront so review and build operate on identical bytes.
+trap _cleanup_build_dirs EXIT
+
+if [ ${#aur_to_build[@]} -gt 0 ]; then
+  info "Cloning ${#aur_to_build[@]} AUR package(s)..."
+  for pkg in "${aur_to_build[@]}"; do
+    _tmpdir=$(mktemp -d /tmp/safe-update-XXXXXX)
+    if git clone --quiet --depth 1 \
+      "https://aur.archlinux.org/${pkg}.git" "$_tmpdir/$pkg" 2>/dev/null; then
+      _build_dirs["$pkg"]="$_tmpdir/$pkg"
+    else
+      err "[$pkg] Clone failed — skipping"
+      rm -rf "$_tmpdir"
+      user_skip_list+=("$pkg")
+    fi
+  done
+fi
+
+if [ ${#aur_to_build[@]} -gt 0 ]; then
+  echo -e "${C}--- PKGBUILD Review ---${N}"
+  echo -e "  ${#aur_to_build[@]} AUR package(s) queued to build: ${aur_to_build[*]}"
+  echo
+  echo -en "${C}Review PKGBUILDs before proceeding? [y/N] ${N}"
+  read -r _review_ans
+  if [[ "$_review_ans" =~ ^[Yy] ]]; then
+    for pkg in "${aur_to_build[@]}"; do
+      [[ -v _build_dirs["$pkg"] ]] || {
+        warn "[$pkg] No clone available — skipping"
+        continue
+      }
+      echo
+      echo -e "${B}════ $pkg ════${N}"
+
+      _pkgb=$(<"${_build_dirs[$pkg]}/PKGBUILD")
+
+      # Show diff vs stored version (or full content on first review)
+      echo -e "${B}PKGBUILD:${N}"
+      _pkgb_changed=false
+      show_pkgbuild_diff "$pkg" "$_pkgb" "PKGBUILD" || _pkgb_changed=true
+
+      # Scan for suspicious patterns
+      echo
+      echo -e "${B}Scanning PKGBUILD...${N}"
+      if scan_pkgbuild "$_pkgb"; then
+        ok "No suspicious patterns"
+      else
+        echo -e "  ${R}↑ review flagged lines above${N}"
+      fi
+
+      # .install file — read from cloned dir, same commit as PKGBUILD
+      _inst=""
+      _inst_changed=false
+      _install_fname=$(grep -oP "(?<=^install=)['\"]?[^'\" \t\n]+" \
+        "${_build_dirs[$pkg]}/PKGBUILD" | tr -d "'\"" | head -1 || true)
+      _install_fname="${_install_fname:-${pkg}.install}"
+      _inst_path="${_build_dirs[$pkg]}/${_install_fname}"
+      if [ -f "$_inst_path" ]; then
+        _inst=$(<"$_inst_path")
+        echo
+        echo -e "${B}.install script (${_install_fname}):${N}"
+        show_pkgbuild_diff "$pkg" "$_inst" "install" || _inst_changed=true
+        echo
+        echo -e "${B}Scanning .install script...${N}"
+        if scan_pkgbuild "$_inst"; then
+          ok "No suspicious patterns in install script"
+        else
+          echo -e "  ${R}↑ suspicious patterns in install script${N}"
+        fi
+      fi
+
+      # Offer full-text view if anything changed or is new
+      if $_pkgb_changed || { [ -n "$_inst" ] && $_inst_changed; }; then
+        echo
+        echo -en "${C}Open full PKGBUILD in pager? [y/N] ${N}"
+        read -r _page_ans
+        if [[ "$_page_ans" =~ ^[Yy] ]]; then
+          printf '%s\n' "$_pkgb" | _show_pkgbuild
+          if [ -n "$_inst" ]; then
+            echo -en "${C}Open .install script in pager? [y/N] ${N}"
+            read -r _page_inst_ans
+            [[ "$_page_inst_ans" =~ ^[Yy] ]] && printf '%s\n' "$_inst" | _show_pkgbuild
+          fi
+        fi
+      fi
+
+      echo
+      echo -en "${C}PKGBUILD OK? [Y=continue  n=skip this package  a=abort all] ${N}"
+      read -r _pkgb_ans
+      case "$_pkgb_ans" in
+      [Nn]*)
+        warn "Skipping '$pkg' — review manually before next update."
+        user_skip_list+=("$pkg")
+        # Remove any stale tarballs for this package so they can't be
+        # accidentally installed. Uses pkgname from the PKGBUILD (not just
+        # the AUR package name) to catch split-package tarballs.
+        mapfile -t _pkgnames < <(_get_pkgnames "${_build_dirs[$pkg]}/PKGBUILD" "$pkg")
+        _removed=0
+        for _pn in "${_pkgnames[@]}"; do
+          while IFS= read -r _tb; do
+            rm -f "$_tb"
+            warn "Removed stale tarball: $(basename "$_tb")"
+            ((_removed++)) || true
+          done < <(find "$AUR_TARBALL_DIR" -maxdepth 1 \
+            \( -name "${_pn}-*.pkg.tar.zst" -o -name "${_pn}-*.pkg.tar.xz" \) \
+            2>/dev/null)
+        done
+        [ $_removed -eq 0 ] &&
+          info "No stale tarballs found for '$pkg' in $AUR_TARBALL_DIR"
+        ;;
+      [Aa]*)
+        warn "Aborting."
+        exit 1
+        ;;
+      *) # Confirmed — save for future diffs
+        printf '%s\n' "$_pkgb" >"$PKGBUILD_STORE/${pkg}.PKGBUILD"
+        [ -n "$_inst" ] && printf '%s\n' "$_inst" >"$PKGBUILD_STORE/${pkg}.install"
+        ;;
+      esac
+    done
+    echo
+  fi
+fi
+
+# ── 6. confirm ────────────────────────────────────────────────────────────────
+if [ "$AUTO" = false ]; then
+  echo -en "${C}Proceed with update? [Y/n] ${N}"
+  read -r confirm
+  [[ "$confirm" =~ ^[Nn] ]] && {
+    echo "Aborted."
+    exit 0
+  }
+fi
+
+# ── 7. update ─────────────────────────────────────────────────────────────────
+declare -a ignore_args=()
+for pkg in "${skip_list[@]+"${skip_list[@]}"}" \
+  "${compromised_list[@]+"${compromised_list[@]}"}" \
+  "${flagged_list[@]+"${flagged_list[@]}"}" \
+  "${unknown[@]+"${unknown[@]}"}" \
+  "${ownership_declined_list[@]+"${ownership_declined_list[@]}"}" \
+  "${user_skip_list[@]+"${user_skip_list[@]}"}"; do
+  ignore_args+=(--ignore "$pkg")
+done
+
+[ ${#user_skip_list[@]} -gt 0 ] && warn "Skipped by PKGBUILD review: ${user_skip_list[*]}"
+[ ${#ownership_declined_list[@]} -gt 0 ] && warn "Skipped (transfer not approved): ${ownership_declined_list[*]}"
+
+echo
+info "Running update..."
+
+if $CHROOT_AVAILABLE; then
+  # 7a. Official repo packages — pacman handles these directly.
+  # Pass aur_to_build as additional ignores so pacman doesn't try to touch them.
+  declare -a aur_ignore=()
+  for pkg in "${aur_to_build[@]+"${aur_to_build[@]}"}"; do
+    aur_ignore+=(--ignore "$pkg")
+  done
+
+  info "Updating official repo packages..."
+  set -x
+  # shellcheck disable=SC2086
+  sudo pacman -Su $CONFIRM_FLAG \
+    "${ignore_args[@]+"${ignore_args[@]}"}" \
+    "${aur_ignore[@]+"${aur_ignore[@]}"}"
+  { set +x; } 2>/dev/null
+
+  # 7b. AUR packages — build each in clean chroot.
+  if [ ${#aur_to_build[@]} -gt 0 ]; then
+    echo
+    info "Building AUR packages in chroot..."
+
+    declare -A _skip_set=()
+    for pkg in "${user_skip_list[@]+"${user_skip_list[@]}"}"; do _skip_set["$pkg"]=1; done
+    for pkg in "${ownership_declined_list[@]+"${ownership_declined_list[@]}"}"; do _skip_set["$pkg"]=1; done
+
+    declare -a failed_builds=()
+    for pkg in "${aur_to_build[@]}"; do
+      [[ -v _skip_set["$pkg"] ]] && continue
+      [[ -v _build_dirs["$pkg"] ]] || {
+        err "[$pkg] No build directory — skipping"
+        continue
+      }
+      build_aur_chroot "$pkg" "${_build_dirs[$pkg]}" || failed_builds+=("$pkg")
+    done
+
+    if [ ${#failed_builds[@]} -gt 0 ]; then
+      warn "These AUR builds failed: ${failed_builds[*]}"
+      warn "Build manually: git clone https://aur.archlinux.org/<pkg>.git && cd <pkg> && makechrootpkg -c -r $CHROOT_DIR"
+    fi
+  fi
+else
+  # Fallback: yay handles everything when chroot is not set up.
+  warn "Chroot not available (run: sudo mkdir -p $CHROOT_DIR && sudo mkarchroot $CHROOT_DIR/root base-devel) — falling back to yay"
+  set -x
+  # shellcheck disable=SC2086
+  yay -Su $CONFIRM_FLAG "${ignore_args[@]+"${ignore_args[@]}"}"
+  { set +x; } 2>/dev/null
+fi
+
+# ── 8. save maintainer DB ─────────────────────────────────────────────────────
+[ ${#_current_maintainer[@]} -gt 0 ] && save_maintainer_db
+
+# ── 9. cleanup caches ─────────────────────────────────────────────────────────
+echo
+cleanup_pkg_caches
+
+echo
+ok "Update complete!"
