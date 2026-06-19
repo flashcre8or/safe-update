@@ -1,6 +1,6 @@
 # safe-update
 
-A hardened rolling-update script for Arch Linux / CachyOS that replaces bare `yay -Su` with layered supply-chain safeguards. Built in direct response to the June 2026 **Atomic Arch** AUR supply-chain attack.
+A hardened rolling-update script for Arch Linux that replaces bare `yay -Su` with layered supply-chain safeguards. Built in direct response to the June 2026 **Atomic Arch** AUR supply-chain attack.
 
 ---
 
@@ -47,7 +47,7 @@ On every run, the AUR `Maintainer` field for each pending package is recorded to
 When a change is detected — including `null → someone` (orphan adoption) and `alice → bob` (transfer) — the script presents an explicit per-package prompt before proceeding. Orphan adoptions are called out separately since they represent a previously unmaintained package gaining a new owner. Approving a transfer sends the package to the PKGBUILD review queue so you can inspect the new maintainer's changes before anything is built. Declining skips it for the current run without affecting other packages.
 
 ### PKGBUILD diff review
-All AUR packages are cloned from AUR git before the review prompt is shown. The PKGBUILD and `.install` file displayed during review are read directly from the cloned directory — the same bytes that `makechrootpkg` will build. This closes the TOCTOU window that existed when the review fetch and the build clone were two separate network requests at different times.
+All AUR packages are cloned from AUR git before the review prompt is shown. The PKGBUILD and `.install` file displayed during review are read directly from the cloned directory — the same bytes that `makechrootpkg` will build.
 
 Approved content is stored in `~/.local/share/safe-update/pkgbuilds/`. On each subsequent update, only the diff is shown rather than the full file, using `bat --language=diff` if available, falling back to `diff --color | less -R`. At the review prompt:
 
