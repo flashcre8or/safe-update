@@ -22,7 +22,8 @@ MIN_AGE_SECONDS=$((MIN_AGE_HOURS * 3600))
 NOW=$(date +%s)
 SCRIPT_NAME=$(basename "$0")
 readonly SCRIPT_NAME
-readonly AUR_API="https://aur.archlinux.org/rpc/v5/info"
+readonly AUR_API="${SAFE_UPDATE_AUR_API:-https://aur.archlinux.org/rpc/v5/info}"
+readonly AUR_GIT_BASE="${SAFE_UPDATE_AUR_BASE:-https://aur.archlinux.org}"
 readonly AUR_BATCH_SIZE=150
 readonly DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/safe-update"
 readonly PKGBUILD_STORE="$DATA_DIR/pkgbuilds"
@@ -61,7 +62,7 @@ err() { echo -e "${R}✗${N} $*" >&2; }
 
 _show_pkgbuild() {
   if command -v bat &>/dev/null; then
-    bat --language=bash --style=numbers,header -
+    bat --language=bash --style=numbers,header --paging=always -
   else
     less -R
   fi
@@ -70,27 +71,61 @@ _show_pkgbuild() {
 # ── scan_pkgbuild ─────────────────────────────────────────────────────────────
 # Print flagged lines with line numbers. Returns 1 if anything suspicious found.
 scan_pkgbuild() {
-  local content="$1"
+  local content="$1" is_install="${2:-false}"
   local -i hits=0
+  # Collapse backslash-newline continuations so multi-line commands scan as one
+  local _flat
+  _flat=$(printf '%s\n' "$content" | sed ':a;N;$!ba;s/\\\n\s*/ /g')
 
   _check() {
     local matches
-    matches=$(printf '%s' "$content" | grep -nP "$2" 2>/dev/null || true)
+    matches=$(printf '%s' "$_flat" | grep -nP "$2" 2>/dev/null || true)
     [ -z "$matches" ] && return 0
     echo -e "  ${R}▶ $1${N}"
     while IFS= read -r m; do echo -e "    ${Y}${m}${N}"; done <<<"$matches"
     return 1
   }
 
-  _check "package manager install (Atomic Arch vector)" '(npm|bun|pip3?|gem|cargo)\s+install' || ((hits++)) || true
+  _check "package manager install (Atomic Arch vector)" \
+    '(npm|bun|pip3?|gem|cargo)\s+i(nstall)?|(yarn|pnpm)\s+(add|install)|npx\s+\S' || ((hits++)) || true
   _check "pipe to shell" '(curl|wget)\b[^#\n]*\|\s*(ba)?sh\b' || ((hits++)) || true
   _check "eval with command substitution" 'eval\s+\$\(' || ((hits++)) || true
   _check "base64 decode" 'base64\s+(-d|--decode)' || ((hits++)) || true
   _check "curl/wget to bare IP address" '(curl|wget)\s+\S*[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' || ((hits++)) || true
+  _check "bare IP address in URL" '(https?|ftp)://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' || ((hits++)) || true
   _check "write to home dir / outside \$pkgdir" '(\$\{?HOME\}?|~/)[^[:space:]]' || ((hits++)) || true
   _check "systemd user-unit path (persistence)" '\.config/systemd/user' || ((hits++)) || true
-  _check "systemctl enable" 'systemctl\s+enable' || ((hits++)) || true
-  _check "background process (nohup/disown)" '\b(nohup|disown)\b' || ((hits++)) || true
+  _check "systemctl enable" 'systemctl\b.*\benable\b' || ((hits++)) || true
+  _check "background process (nohup/disown/&)" '\b(nohup|disown)\b|\s+&\s*$' || ((hits++)) || true
+
+  # source=() scheme check — extracts URLs from source=() entries only and flags
+  # insecure schemes. Bare IP URLs are caught by the named _check above.
+  # Content inspection is deferred — see project_safe_update_next memory.
+  local _src_urls _src_hit=0
+  _src_urls=$(printf '%s\n' "$content" \
+    | grep -P '^\s*source\s*[+]?=|\bsource\s*[+]?=\s*\(' \
+    | grep -oP '(https?|ftp|git\+https?)://\S+' || true)
+  if [ -n "$_src_urls" ]; then
+    if printf '%s\n' "$_src_urls" | grep -qP '^http://'; then
+      echo -e "  ${R}▶ source=() entry uses plain http (not https)${N}"
+      ((_src_hit++)) || true
+    fi
+    if printf '%s\n' "$_src_urls" | grep -qP '^ftp://'; then
+      echo -e "  ${R}▶ source=() entry uses ftp scheme${N}"
+      ((_src_hit++)) || true
+    fi
+    ((hits += _src_hit)) || true
+  fi
+
+  # .install hook patterns — run as root at install/upgrade/remove time
+  if [ "$is_install" = true ]; then
+    _check "PAM config modification" '/etc/pam\.d/' || ((hits++)) || true
+    _check "sudoers modification" 'visudo\b|/etc/sudoers' || ((hits++)) || true
+    _check "cron job installation" '/etc/cron' || ((hits++)) || true
+    _check "system-level unit install" '/etc/systemd/system/' || ((hits++)) || true
+    _check "login shell persistence" '/etc/profile\.d/|/etc/environment\b' || ((hits++)) || true
+    _check "setuid or root chown" 'chown\s+root|chmod\s+[0-9]*s[0-9]' || ((hits++)) || true
+  fi
 
   [ $hits -gt 0 ] && return 1 || return 0
 }
@@ -103,6 +138,7 @@ show_pkgbuild_diff() {
 
   if [ ! -f "$stored" ]; then
     echo -e "  ${Y}First time reviewing — no stored version, showing full content${N}"
+    read -rsp $'  Press any key to open...\n' -n1
     printf '%s\n' "$content" | _show_pkgbuild
     return 1
   fi
@@ -219,7 +255,7 @@ save_maintainer_db() {
   fi >>"$tmp"
   # Write/update entries seen this run
   for _pkg in "${!_current_maintainer[@]}"; do
-    printf '%s\t%s\t%s\n' "$_pkg" "${_current_maintainer[$_pkg]}" "$NOW"
+    printf '%s\t%s\t%s\n' "$_pkg" "${_current_maintainer[$_pkg]}" "$(date +%s)"
   done >>"$tmp"
   mv "$tmp" "$MAINTAINER_DB"
   ok "Maintainer DB saved (${#_current_maintainer[@]} entries written)"
@@ -318,7 +354,7 @@ fi
 
 # ── 2. pending updates ────────────────────────────────────────────────────────
 info "Checking for available updates..."
-mapfile -t raw_updates < <(yay -Qu 2>/dev/null | grep -v '^\s*$' || true)
+mapfile -t raw_updates < <(yay -Qu 2>/dev/null | grep -E '^\S+ \S+ -> \S+' || true)
 if [ ${#raw_updates[@]} -eq 0 ]; then
   ok "System is up to date!"
   exit 0
@@ -347,7 +383,7 @@ declare -A _build_dirs=()
 
 age_pkg() {
   local pkg=$1 age build_epoch
-  build_epoch=$(expac -t '%s' -S '%n %b' "$pkg" 2>/dev/null | awk 'NR==1{print $2}')
+  build_epoch=$(expac -t '%s' -S '%n %b' "$pkg" 2>/dev/null | awk 'NR==1{print $2}' || true)
   if [ -n "$build_epoch" ] && [ "$build_epoch" != "$pkg" ]; then
     age=$((NOW - build_epoch))
     [ "$age" -ge "$MIN_AGE_SECONDS" ] && safe_list+=("$pkg") || skip_list+=("$pkg")
@@ -374,7 +410,10 @@ resolve_aur_batch() {
       first=false
     } || args+="&arg%5B%5D=$pkg"
   done
-  data=$(curl -sf "$AUR_API?$args" 2>/dev/null) || return
+  if ! data=$(curl -sf "$AUR_API?$args" 2>/dev/null); then
+    warn "AUR API request failed — packages in this batch treated as unknown (network issue?)."
+    return
+  fi
 
   while read -r line; do
     name=$(echo "$line" | jq -r '.Name         // empty')
@@ -406,10 +445,10 @@ if [ ${#search_aur[@]} -gt 0 ]; then
     resolve_aur_batch "${batch[@]}"
   done
 
-  mapfile -t safe_list < <(printf '%s\n' "${safe_list[@]+"${safe_list[@]}"}" | sort -u)
-  mapfile -t skip_list < <(printf '%s\n' "${skip_list[@]+"${skip_list[@]}"}" | sort -u)
-  mapfile -t flagged_list < <(printf '%s\n' "${flagged_list[@]+"${flagged_list[@]}"}" | sort -u)
-  mapfile -t devel_list < <(printf '%s\n' "${devel_list[@]+"${devel_list[@]}"}" | sort -u)
+  mapfile -t safe_list < <(printf '%s\n' "${safe_list[@]+"${safe_list[@]}"}" | sort -u | grep -v '^$')
+  mapfile -t skip_list < <(printf '%s\n' "${skip_list[@]+"${skip_list[@]}"}" | sort -u | grep -v '^$')
+  mapfile -t flagged_list < <(printf '%s\n' "${flagged_list[@]+"${flagged_list[@]}"}" | sort -u | grep -v '^$')
+  mapfile -t devel_list < <(printf '%s\n' "${devel_list[@]+"${devel_list[@]}"}" | sort -u | grep -v '^$')
 
   declare -A _resolved=()
   for pkg in "${safe_list[@]+"${safe_list[@]}"}" "${skip_list[@]+"${skip_list[@]}"}" \
@@ -537,10 +576,25 @@ declare -a aur_to_build=()
 for pkg in "${safe_list[@]+"${safe_list[@]}"}" "${devel_list[@]+"${devel_list[@]}"}"; do
   [[ -v _is_aur["$pkg"] ]] && aur_to_build+=("$pkg")
 done
-# Approved ownership transfers join the PKGBUILD review queue
+# Approved ownership transfers join the PKGBUILD review queue (H1: re-check gates)
+declare -A _skip_set=() _flagged_set=()
+for _p in "${skip_list[@]+"${skip_list[@]}"}"; do _skip_set["$_p"]=1; done
+for _p in "${flagged_list[@]+"${flagged_list[@]}"}"; do _flagged_set["$_p"]=1; done
 for pkg in "${ownership_approved_list[@]+"${ownership_approved_list[@]}"}"; do
+  if [[ -v _skip_set["$pkg"] ]]; then
+    warn "'$pkg' ownership approved but package is too new — age gate still applies."
+    user_skip_list+=("$pkg"); continue
+  fi
+  if [[ -v _flagged_set["$pkg"] ]]; then
+    warn "'$pkg' ownership approved but package is OutOfDate — still flagged."
+    flagged_list+=("$pkg"); continue
+  fi
   aur_to_build+=("$pkg")
 done
+unset _skip_set _flagged_set
+# Deduplicate in case a package appears in both safe_list and ownership_approved_list
+mapfile -t aur_to_build < <(printf '%s\n' \
+  "${aur_to_build[@]+"${aur_to_build[@]}"}" | sort -u | grep -v '^$')
 
 # Clone all AUR packages upfront so review and build operate on identical bytes.
 trap _cleanup_build_dirs EXIT
@@ -550,7 +604,7 @@ if [ ${#aur_to_build[@]} -gt 0 ]; then
   for pkg in "${aur_to_build[@]}"; do
     _tmpdir=$(mktemp -d /tmp/safe-update-XXXXXX)
     if git clone --quiet --depth 1 \
-      "https://aur.archlinux.org/${pkg}.git" "$_tmpdir/$pkg" 2>/dev/null; then
+      "${AUR_GIT_BASE}/${pkg}.git" "$_tmpdir/$pkg" 2>/dev/null; then
       _build_dirs["$pkg"]="$_tmpdir/$pkg"
     else
       err "[$pkg] Clone failed — skipping"
@@ -560,13 +614,56 @@ if [ ${#aur_to_build[@]} -gt 0 ]; then
   done
 fi
 
-if [ ${#aur_to_build[@]} -gt 0 ]; then
+if [ ${#_build_dirs[@]} -gt 0 ]; then
   echo -e "${C}--- PKGBUILD Review ---${N}"
-  echo -e "  ${#aur_to_build[@]} AUR package(s) queued to build: ${aur_to_build[*]}"
+  echo -e "  ${#_build_dirs[@]} AUR package(s) queued to build: ${!_build_dirs[*]}"
   echo
-  echo -en "${C}Review PKGBUILDs before proceeding? [y/N] ${N}"
-  read -r _review_ans
-  if [[ "$_review_ans" =~ ^[Yy] ]]; then
+  declare -a _batch_queue=()
+    declare -A _batch_pkgb=()
+    declare -A _batch_inst=()
+
+    _defer_pkg() {
+      local pkg="$1"
+      user_skip_list+=("$pkg")
+      info "Deferring '$pkg' — will appear again next run."
+      info "  PKGBUILD : $PKGBUILD_STORE/${pkg}.PKGBUILD"
+      # Show the specific path of the most recent existing tarball, if any
+      local _pkgnames _newest=""
+      mapfile -t _pkgnames < <(_get_pkgnames "${_build_dirs[$pkg]}/PKGBUILD" "$pkg")
+      for _pn in "${_pkgnames[@]}"; do
+        local _candidate
+        _candidate=$(find "$AUR_TARBALL_DIR" -maxdepth 1 \
+          \( -name "${_pn}-*.pkg.tar.zst" -o -name "${_pn}-*.pkg.tar.xz" \) \
+          -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+        if [ -n "$_candidate" ] && { [ -z "$_newest" ] || \
+           [[ $(stat -c '%Y' "$_candidate" 2>/dev/null) -gt \
+              $(stat -c '%Y' "$_newest"   2>/dev/null) ]]; }; then
+          _newest="$_candidate"
+        fi
+      done
+      if [ -n "$_newest" ]; then info "  Last build: $_newest"; fi
+    }
+
+    _skip_pkg_with_cleanup() {
+      local pkg="$1"
+      warn "Flagging '$pkg' — newest tarball removed, older versions kept for rollback."
+      user_skip_list+=("$pkg")
+      mapfile -t _pkgnames < <(_get_pkgnames "${_build_dirs[$pkg]}/PKGBUILD" "$pkg")
+      local _removed=0
+      for _pn in "${_pkgnames[@]}"; do
+        local _newest
+        _newest=$(find "$AUR_TARBALL_DIR" -maxdepth 1 \
+          \( -name "${_pn}-*.pkg.tar.zst" -o -name "${_pn}-*.pkg.tar.xz" \) \
+          -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+        if [ -n "$_newest" ]; then
+          rm -f "$_newest"
+          warn "Removed newest tarball: $(basename "$_newest")"
+          ((_removed++)) || true
+        fi
+      done
+      [ $_removed -eq 0 ] && info "No tarball found for '$pkg' in $AUR_TARBALL_DIR"
+    }
+
     for pkg in "${aur_to_build[@]}"; do
       [[ -v _build_dirs["$pkg"] ]] || {
         warn "[$pkg] No clone available — skipping"
@@ -577,23 +674,23 @@ if [ ${#aur_to_build[@]} -gt 0 ]; then
 
       _pkgb=$(<"${_build_dirs[$pkg]}/PKGBUILD")
 
-      # Show diff vs stored version (or full content on first review)
       echo -e "${B}PKGBUILD:${N}"
       _pkgb_changed=false
       show_pkgbuild_diff "$pkg" "$_pkgb" "PKGBUILD" || _pkgb_changed=true
 
-      # Scan for suspicious patterns
       echo
       echo -e "${B}Scanning PKGBUILD...${N}"
+      _scan_hit=false
       if scan_pkgbuild "$_pkgb"; then
         ok "No suspicious patterns"
       else
         echo -e "  ${R}↑ review flagged lines above${N}"
+        _scan_hit=true
       fi
 
-      # .install file — read from cloned dir, same commit as PKGBUILD
       _inst=""
       _inst_changed=false
+      _inst_scan_hit=false
       _install_fname=$(grep -oP "(?<=^install=)['\"]?[^'\" \t\n]+" \
         "${_build_dirs[$pkg]}/PKGBUILD" | tr -d "'\"" | head -1 || true)
       _install_fname="${_install_fname:-${pkg}.install}"
@@ -605,15 +702,17 @@ if [ ${#aur_to_build[@]} -gt 0 ]; then
         show_pkgbuild_diff "$pkg" "$_inst" "install" || _inst_changed=true
         echo
         echo -e "${B}Scanning .install script...${N}"
-        if scan_pkgbuild "$_inst"; then
+        if scan_pkgbuild "$_inst" true; then
           ok "No suspicious patterns in install script"
         else
           echo -e "  ${R}↑ suspicious patterns in install script${N}"
+          _inst_scan_hit=true
         fi
       fi
 
-      # Offer full-text view if anything changed or is new
-      if $_pkgb_changed || { [ -n "$_inst" ] && $_inst_changed; }; then
+      # Flagged: scanner hits, first-time review, or changed .install — explicit per-package flow.
+      # Clean: goes to batch approval at the end.
+      if $_pkgb_changed || $_scan_hit || { [ -n "$_inst" ] && { $_inst_changed || $_inst_scan_hit; }; }; then
         echo
         echo -en "${C}Open full PKGBUILD in pager? [y/N] ${N}"
         read -r _page_ans
@@ -625,44 +724,117 @@ if [ ${#aur_to_build[@]} -gt 0 ]; then
             [[ "$_page_inst_ans" =~ ^[Yy] ]] && printf '%s\n' "$_inst" | _show_pkgbuild
           fi
         fi
-      fi
-
-      echo
-      echo -en "${C}PKGBUILD OK? [Y=continue  n=skip this package  a=abort all] ${N}"
-      read -r _pkgb_ans
-      case "$_pkgb_ans" in
-      [Nn]*)
-        warn "Skipping '$pkg' — review manually before next update."
-        user_skip_list+=("$pkg")
-        # Remove any stale tarballs for this package so they can't be
-        # accidentally installed. Uses pkgname from the PKGBUILD (not just
-        # the AUR package name) to catch split-package tarballs.
-        mapfile -t _pkgnames < <(_get_pkgnames "${_build_dirs[$pkg]}/PKGBUILD" "$pkg")
-        _removed=0
-        for _pn in "${_pkgnames[@]}"; do
-          while IFS= read -r _tb; do
-            rm -f "$_tb"
-            warn "Removed stale tarball: $(basename "$_tb")"
-            ((_removed++)) || true
-          done < <(find "$AUR_TARBALL_DIR" -maxdepth 1 \
-            \( -name "${_pn}-*.pkg.tar.zst" -o -name "${_pn}-*.pkg.tar.xz" \) \
-            2>/dev/null)
+        while true; do
+          echo
+          echo -en "${C}PKGBUILD OK? [Y=continue  n=delete tarball  d=defer  r=review  a=abort all] ${N}"
+          read -r _pkgb_ans
+          case "$_pkgb_ans" in
+          [Nn]*) _skip_pkg_with_cleanup "$pkg"; break ;;
+          [Dd]*)
+            _defer_pkg "$pkg"
+            break
+            ;;
+          [Rr]*)
+            printf '%s\n' "$_pkgb" | _show_pkgbuild
+            if [ -n "$_inst" ]; then
+              echo -en "${C}Open .install script in pager? [y/N] ${N}"
+              read -r _page_inst_ans
+              [[ "$_page_inst_ans" =~ ^[Yy] ]] && printf '%s\n' "$_inst" | _show_pkgbuild
+            fi
+            ;;
+          [Aa]*) warn "Aborting."; exit 1 ;;
+          [Yy]*)
+            printf '%s\n' "$_pkgb" >"$PKGBUILD_STORE/${pkg}.PKGBUILD"
+            [ -n "$_inst" ] && printf '%s\n' "$_inst" >"$PKGBUILD_STORE/${pkg}.install"
+            break
+            ;;
+          *) warn "Please enter Y, n, d, r, or a." ;;
+          esac
         done
-        [ $_removed -eq 0 ] &&
-          info "No stale tarballs found for '$pkg' in $AUR_TARBALL_DIR"
-        ;;
-      [Aa]*)
-        warn "Aborting."
-        exit 1
-        ;;
-      *) # Confirmed — save for future diffs
-        printf '%s\n' "$_pkgb" >"$PKGBUILD_STORE/${pkg}.PKGBUILD"
-        [ -n "$_inst" ] && printf '%s\n' "$_inst" >"$PKGBUILD_STORE/${pkg}.install"
-        ;;
-      esac
+      else
+        _batch_queue+=("$pkg")
+        _batch_pkgb["$pkg"]="$_pkgb"
+        [ -n "$_inst" ] && _batch_inst["$pkg"]="$_inst"
+      fi
     done
+
+    # Batch approval for clean packages
+    if [ ${#_batch_queue[@]} -gt 0 ]; then
+      while true; do
+        echo
+        echo -e "${B}--- Clean PKGBUILDs ---${N}"
+        echo -e "  ${_batch_queue[*]}"
+        echo
+        echo -en "${C}PKGBUILD OK? [Y=build all  d=defer  r=review  a=abort] ${N}"
+        read -r _batch_ans
+
+        case "$_batch_ans" in
+        [Yy]|"")
+          for pkg in "${_batch_queue[@]}"; do
+            printf '%s\n' "${_batch_pkgb[$pkg]}" >"$PKGBUILD_STORE/${pkg}.PKGBUILD"
+            [[ -v _batch_inst["$pkg"] ]] && printf '%s\n' "${_batch_inst[$pkg]}" >"$PKGBUILD_STORE/${pkg}.install"
+          done
+          break
+          ;;
+        [Dd]*|[Rr]*)
+          [[ "$_batch_ans" =~ ^[Dd] ]] && _verb="Defer" || _verb="Review"
+          echo
+          for i in "${!_batch_queue[@]}"; do
+            echo -e "  $((i+1))) ${_batch_queue[$i]}"
+          done
+          echo -en "${C}${_verb} which? [1-${#_batch_queue[@]}  q=back] ${N}"
+          read -r _bnum
+          [[ "$_bnum" =~ ^[Qq]$|^$ ]] && continue
+          _bidx=$((_bnum - 1))
+          if [[ ! $_bidx -ge 0 || ! $_bidx -lt ${#_batch_queue[@]} ]]; then
+            warn "Invalid selection."; continue
+          fi
+          pkg="${_batch_queue[$_bidx]}"
+          if [[ "$_batch_ans" =~ ^[Dd] ]]; then
+            _defer_pkg "$pkg"
+            _batch_queue=("${_batch_queue[@]:0:$_bidx}" "${_batch_queue[@]:$((_bidx+1))}")
+            [ ${#_batch_queue[@]} -eq 0 ] && break
+          else
+            # Per-package sub-loop: same options as flagged flow
+            while true; do
+              printf '%s\n' "${_batch_pkgb[$pkg]}" | _show_pkgbuild
+              if [[ -v _batch_inst["$pkg"] ]]; then
+                echo -en "${C}Open .install script in pager? [y/N] ${N}"
+                read -r _page_inst_ans
+                [[ "$_page_inst_ans" =~ ^[Yy] ]] && printf '%s\n' "${_batch_inst[$pkg]}" | _show_pkgbuild
+              fi
+              echo
+              echo -en "${C}PKGBUILD OK? [Y=continue  n=delete tarball  d=defer  r=review  a=abort all] ${N}"
+              read -r _sub_ans
+              case "$_sub_ans" in
+              [Yy]*)
+                # Keep in queue — will be built with the rest
+                break
+                ;;
+              [Nn]*)
+                _skip_pkg_with_cleanup "$pkg"
+                _batch_queue=("${_batch_queue[@]:0:$_bidx}" "${_batch_queue[@]:$((_bidx+1))}")
+                [ ${#_batch_queue[@]} -eq 0 ] && break 2
+                break
+                ;;
+              [Dd]*)
+                _defer_pkg "$pkg"
+                _batch_queue=("${_batch_queue[@]:0:$_bidx}" "${_batch_queue[@]:$((_bidx+1))}")
+                [ ${#_batch_queue[@]} -eq 0 ] && break 2
+                break
+                ;;
+              [Rr]*) ;; # loop: re-open pager
+              [Aa]*) warn "Aborting."; exit 1 ;;
+              *) warn "Please enter Y, n, d, r, or a." ;;
+              esac
+            done
+          fi
+          ;;
+        [Aa]*) warn "Aborting."; exit 1 ;;
+        esac
+      done
+    fi
     echo
-  fi
 fi
 
 # ── 6. confirm ────────────────────────────────────────────────────────────────
@@ -677,14 +849,18 @@ fi
 
 # ── 7. update ─────────────────────────────────────────────────────────────────
 declare -a ignore_args=()
+declare -A _seen_ignore=()
 for pkg in "${skip_list[@]+"${skip_list[@]}"}" \
   "${compromised_list[@]+"${compromised_list[@]}"}" \
   "${flagged_list[@]+"${flagged_list[@]}"}" \
   "${unknown[@]+"${unknown[@]}"}" \
   "${ownership_declined_list[@]+"${ownership_declined_list[@]}"}" \
   "${user_skip_list[@]+"${user_skip_list[@]}"}"; do
+  [[ -v _seen_ignore["$pkg"] ]] && continue
+  _seen_ignore["$pkg"]=1
   ignore_args+=(--ignore "$pkg")
 done
+# _seen_ignore kept alive — reused below to dedup aur_ignore against ignore_args
 
 [ ${#user_skip_list[@]} -gt 0 ] && warn "Skipped by PKGBUILD review: ${user_skip_list[*]}"
 [ ${#ownership_declined_list[@]} -gt 0 ] && warn "Skipped (transfer not approved): ${ownership_declined_list[*]}"
@@ -697,8 +873,10 @@ if $CHROOT_AVAILABLE; then
   # Pass aur_to_build as additional ignores so pacman doesn't try to touch them.
   declare -a aur_ignore=()
   for pkg in "${aur_to_build[@]+"${aur_to_build[@]}"}"; do
+    [[ -v _seen_ignore["$pkg"] ]] && continue
     aur_ignore+=(--ignore "$pkg")
   done
+  unset _seen_ignore
 
   info "Updating official repo packages..."
   set -x
